@@ -1,5 +1,5 @@
 FROM node:20-alpine AS base
-RUN corepack enable && corepack prepare pnpm@9激活
+RUN corepack enable && corepack prepare pnpm@9
 
 # Build stage
 FROM base AS builder
