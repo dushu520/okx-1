@@ -14,7 +14,7 @@ import {
 import {
   getBids, getAsks, getConfirmedCandles,
   getPriceSampleCount, getWeightedImbalance, hasEnoughData,
-  getCandlesForChart,
+  getCandlesForChartBar, CHART_BARS,
 } from "./market-data.js";
 
 export function setupRoutes(): Router {
@@ -25,9 +25,10 @@ export function setupRoutes(): Router {
     res.json(state.getSnapshot());
   });
 
-  // Candles for chart
-  router.get("/api/candles", (_req: Request, res: Response) => {
-    res.json({ candles: getCandlesForChart(100) });
+  // Candles for chart (optional ?bar=1m|5m|15m|1H, default 5m)
+  router.get("/api/candles", (req: Request, res: Response) => {
+    const bar = CHART_BARS.includes(req.query.bar as any) ? req.query.bar as string : "5m";
+    res.json({ bar, candles: getCandlesForChartBar(bar, 100) });
   });
 
   // Trade history (from DB for completeness)

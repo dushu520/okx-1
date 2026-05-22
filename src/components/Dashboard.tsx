@@ -42,6 +42,7 @@ export function Dashboard() {
   const autoTrader = d?.auto_trader;
   const candles = d?.candles;
   const currentCandle = d?.current_candle;
+  const tradeMarkers = d?.trade_markers ?? [];
   const atRunning = autoTrader?.running ?? false;
   const atImbalance = autoTrader?.imbalance ?? 0;
   const atRsi = autoTrader?.rsi ?? 0;
@@ -125,6 +126,15 @@ export function Dashboard() {
             currentCandle={currentCandle}
             autoTrader={autoTrader}
             currentPrice={price}
+            positions={positions}
+            recentTrades={recentTrades}
+            tradeMarkers={tradeMarkers}
+            candleMap={{
+              "1m": { candles: d?.candles_1m, currentCandle: d?.current_candle_1m },
+              "5m": { candles, currentCandle },
+              "15m": { candles: d?.candles_15m, currentCandle: d?.current_candle_15m },
+              "1H": { candles: d?.candles_1h, currentCandle: d?.current_candle_1h },
+            }}
           />
         </div>
 
@@ -173,13 +183,13 @@ export function Dashboard() {
               <div className="stats-compact-item">
                 <span className="stats-compact-label">余额</span>
                 <span className="stats-compact-value" style={{ color: balance >= initialBalance ? "var(--green)" : "var(--red)" }}>
-                  ${balance.toFixed(0)}
+                  ${balance.toFixed(2)}
                 </span>
               </div>
               <div className="stats-compact-item">
                 <span className="stats-compact-label">总盈亏</span>
                 <span className="stats-compact-value" style={{ color: totalPnl >= 0 ? "var(--green)" : "var(--red)" }}>
-                  {totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(0)}
+                  {totalPnl >= 0 ? "+" : ""}${totalPnl.toFixed(2)}
                   <span className="stats-compact-sub"> ({totalPnl >= 0 ? "+" : ""}{pnlPct}%)</span>
                 </span>
               </div>
@@ -195,12 +205,12 @@ export function Dashboard() {
               </div>
               <div className="stats-compact-item">
                 <span className="stats-compact-label">仓位价值</span>
-                <span className="stats-compact-value">${totalPositionValue.toFixed(0)}</span>
+                <span className="stats-compact-value">${totalPositionValue.toFixed(2)}</span>
               </div>
               <div className="stats-compact-item">
                 <span className="stats-compact-label">浮动盈亏</span>
                 <span className="stats-compact-value" style={{ color: totalUnrealizedPnl >= 0 ? "var(--green)" : "var(--red)" }}>
-                  {totalUnrealizedPnl >= 0 ? "+" : ""}${totalUnrealizedPnl.toFixed(0)}
+                  {totalUnrealizedPnl >= 0 ? "+" : ""}${totalUnrealizedPnl.toFixed(2)}
                 </span>
               </div>
               <div className="stats-compact-item">
@@ -214,7 +224,7 @@ export function Dashboard() {
               <div className="stats-compact-item">
                 <span className="stats-compact-label">真实余额</span>
                 <span className="stats-compact-value" style={{ color: "var(--yellow)" }}>
-                  {realBalance > 0 ? "$" + realBalance.toFixed(0) : "--"}
+                  {realBalance > 0 ? "$" + realBalance.toFixed(2) : "--"}
                 </span>
               </div>
               <div className="stats-compact-item">

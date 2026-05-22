@@ -175,20 +175,26 @@ export function hasEnoughData(): boolean {
   );
 }
 
-// ---- REST fetch for candles (5m via polling, no WS) ----
+// ---- Multi-timeframe candle support ----
 
-const BAR = "5m";
-const MAX_CANDLES = 50;
+const CHART_BARS = ["1m", "5m", "15m", "1H"] as const;
+export type ChartBar = (typeof CHART_BARS)[number];
+const MAX_CANDLES = 150;
 
-/** Internal: fetch candles from OKX REST API. */
-async function fetchFromREST(limit: number): Promise<string[][] | null> {
-  try {
-    const url = `${cfg.restBase}/api/v5/market/candles?instId=BTC-USDT&bar=${BAR}&limit=${limit}`;
-    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
-    const data: any = await resp.json();
-    if (data.code === "0" && Array.isArray(data.data)) return data.data;
-  } catch { /* ignore */ }
-  return null;
+interface CandleStore {
+  confirmed: Candle[];
+  current: Candle | null;
+}
+
+// Primary store (used by indicators and auto-trader)
+// Duplicated with extraStores["5m"], kept separate to minimize diff
+// Extra stores for chart display
+const extraStores: Map<string, CandleStore> = new Map();
+
+function getBarStore(bar: string): CandleStore {
+  let s = extraStores.get(bar);
+  if (!s) { s = { confirmed: [], current: null }; extraStores.set(bar, s); }
+  return s;
 }
 
 /** Parse a raw OKX candle array (9 elements) into a Candle. */
@@ -197,47 +203,91 @@ function parseCandle(arr: string[]): Candle {
   return { ts: parseInt(ts), open: parseFloat(o), high: parseFloat(h), low: parseFloat(l), close: parseFloat(c), volume: parseFloat(vol) };
 }
 
-/** Initial fetch: load 50 5m candles at startup. */
-export async function fetchInitialCandles(): Promise<void> {
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    const raw = await fetchFromREST(50);
-    if (!raw) { await new Promise((r) => setTimeout(r, 2000)); continue; }
-
-    // REST returns newest-first; reverse to chronological
-    // Separate confirmed candles from the forming one
-    const confirmed = raw.filter((a) => a[8] === "1").reverse();
-    confirmedCandles = confirmed.map(parseCandle);
-
-    const forming = raw.find((a) => a[8] === "0");
-    currentCandle = forming ? parseCandle(forming) : null;
-
-    console.log(`[market-data] Loaded ${confirmedCandles.length} 5m candles`);
-    return;
-  }
-  console.warn(`[market-data] Failed to fetch initial candles after 3 attempts`);
+/** Internal: fetch candles from OKX REST API for given bar. */
+async function fetchFromREST(bar: string, limit: number): Promise<string[][] | null> {
+  try {
+    const url = `${cfg.restBase}/api/v5/market/candles?instId=BTC-USDT&bar=${bar}&limit=${limit}`;
+    const resp = await fetch(url, { signal: AbortSignal.timeout(8000) });
+    const data: any = await resp.json();
+    if (data.code === "0" && Array.isArray(data.data)) return data.data;
+  } catch { /* ignore */ }
+  return null;
 }
 
-/** Periodic refresh: fetch latest 5 candles and merge into store. */
-export async function refreshCandles(): Promise<void> {
-  const raw = await fetchFromREST(5);
-  if (!raw) return;
-
+function mergeCandles(store: CandleStore, raw: string[][]): void {
   // raw is newest-first; iterate oldest-first so newer data overwrites older
   for (let i = raw.length - 1; i >= 0; i--) {
     const arr = raw[i];
     const candle = parseCandle(arr);
-
     if (arr[8] === "1") {
-      // Confirmed candle: update in-place or append
-      const last = confirmedCandles[confirmedCandles.length - 1];
+      const last = store.confirmed[store.confirmed.length - 1];
       if (last && last.ts === candle.ts) {
-        confirmedCandles[confirmedCandles.length - 1] = candle;
+        store.confirmed[store.confirmed.length - 1] = candle;
       } else if (!last || candle.ts > last.ts) {
-        confirmedCandles.push(candle);
-        if (confirmedCandles.length > MAX_CANDLES) confirmedCandles.shift();
+        store.confirmed.push(candle);
+        if (store.confirmed.length > MAX_CANDLES) store.confirmed.shift();
       }
     } else {
-      currentCandle = candle;
+      store.current = candle;
     }
   }
 }
+
+/** Initial fetch: load N candles for a given bar at startup. */
+export async function fetchCandlesForBar(bar: string, limit: number = 50): Promise<void> {
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const raw = await fetchFromREST(bar, limit);
+    if (!raw) { await new Promise((r) => setTimeout(r, 2000)); continue; }
+    const store = getBarStore(bar);
+    store.confirmed = raw.filter((a) => a[8] === "1").reverse().map(parseCandle);
+    const forming = raw.find((a) => a[8] === "0");
+    store.current = forming ? parseCandle(forming) : null;
+
+    // Keep legacy confirmedCandles/currentCandle in sync for 5m (used by indicators)
+    if (bar === "5m") {
+      confirmedCandles = store.confirmed;
+      currentCandle = store.current;
+    }
+
+    console.log(`[market-data] Loaded ${store.confirmed.length} ${bar} candles`);
+    return;
+  }
+  console.warn(`[market-data] Failed to fetch ${bar} candles after 3 attempts`);
+}
+
+/** Periodic refresh: fetch latest 5 candles for a bar and merge. */
+export async function refreshCandlesForBar(bar: string): Promise<void> {
+  const raw = await fetchFromREST(bar, 5);
+  if (!raw) return;
+  mergeCandles(getBarStore(bar), raw);
+
+  // Keep legacy variables in sync for 5m
+  if (bar === "5m") {
+    const store = getBarStore("5m");
+    confirmedCandles = store.confirmed;
+    currentCandle = store.current;
+  }
+}
+
+/** Get candles formatted for chart for any bar. */
+export function getCandlesForChartBar(bar: string, n: number): any[] {
+  const store = extraStores.get(bar);
+  if (!store) return [];
+  const seen = new Set<number>();
+  const unique: Candle[] = [];
+  for (let i = store.confirmed.length - 1; i >= 0 && unique.length < n; i--) {
+    const c = store.confirmed[i];
+    if (!seen.has(c.ts)) { seen.add(c.ts); unique.unshift(c); }
+  }
+  return unique.map((c) => ({
+    time: Math.floor(c.ts / 1000),
+    open: c.open, high: c.high, low: c.low, close: c.close, volume: c.volume,
+  }));
+}
+
+/** Get current (forming) candle for any bar. */
+export function getCurrentCandleForBar(bar: string): Candle | null {
+  return extraStores.get(bar)?.current ?? null;
+}
+
+export { CHART_BARS, CHART_BARS as BARS };

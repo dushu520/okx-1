@@ -45,6 +45,21 @@ export interface StateSnapshot {
   auto_trader: AutoTraderState;
   candles?: CandlePoint[];
   current_candle?: CandlePoint | null;
+  candles_1m?: CandlePoint[];
+  current_candle_1m?: CandlePoint | null;
+  candles_15m?: CandlePoint[];
+  current_candle_15m?: CandlePoint | null;
+  candles_1h?: CandlePoint[];
+  current_candle_1h?: CandlePoint | null;
+  trade_markers?: TradeMarker[];
+}
+
+export interface TradeMarker {
+  time: number;
+  position: "aboveBar" | "belowBar" | "inBar";
+  shape: string;
+  color: string;
+  text: string;
 }
 
 export interface CandlePoint {

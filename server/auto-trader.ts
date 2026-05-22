@@ -5,7 +5,7 @@
  */
 import { state } from "./shared-state.js";
 import { settings } from "./settings.js";
-import { openTrade, manualClose } from "./trading-engine.js";
+import { openTrade } from "./trading-engine.js";
 import {
   getWeightedImbalance,
   checkMomentum,
@@ -98,27 +98,6 @@ function check(): void {
     }
   }
 
-  // ---- LONG exit ----
-  if (hasPosition && autoPositionSide === "long") {
-    if (
-      imbalance < settings.imbalanceSell &&
-      checkMomentum("down", settings.momentumTicks) &&
-      volAboveAvg() &&
-      calcRSI(settings.rsiPeriod) > settings.rsiSellMin
-    ) {
-      const result = manualClose(autoPositionId!, price);
-      if (result) {
-        logger.info(
-          `SELL #${autoPositionId} | pnl=${result.pnl.toFixed(2)} (${result.pnlPct.toFixed(1)}%) | ` +
-          `imbalance=${imbalance.toFixed(2)} rsi=${calcRSI(settings.rsiPeriod).toFixed(1)}`
-        );
-      }
-      autoPositionId = null;
-      autoPositionSide = null;
-    }
-    return; // skip short checks while holding a position (one position at a time)
-  }
-
   // ---- SHORT entry ----
   if (!hasPosition && hasEnoughBalance()) {
     if (
@@ -141,25 +120,6 @@ function check(): void {
     }
   }
 
-  // ---- SHORT cover ----
-  if (hasPosition && autoPositionSide === "short") {
-    if (
-      imbalance > settings.imbalanceBuy &&
-      checkMomentum("up", settings.momentumTicks) &&
-      volAboveAvg() &&
-      calcRSI(settings.rsiPeriod) < settings.rsiBuyMax
-    ) {
-      const result = manualClose(autoPositionId!, price);
-      if (result) {
-        logger.info(
-          `COVER #${autoPositionId} | pnl=${result.pnl.toFixed(2)} (${result.pnlPct.toFixed(1)}%) | ` +
-          `imbalance=${imbalance.toFixed(2)} rsi=${calcRSI(settings.rsiPeriod).toFixed(1)}`
-        );
-      }
-      autoPositionId = null;
-      autoPositionSide = null;
-    }
-  }
 }
 
 // ---- Lifecycle ----

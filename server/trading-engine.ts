@@ -174,13 +174,13 @@ export function openTrade(
   return id;
 }
 
-/** Manually close a position (called from routes) */
-export function manualClose(tradeId: number, exitPrice: number): { pnl: number; pnlPct: number } | null {
+/** Close a position (called from routes or auto-trader) */
+export function manualClose(tradeId: number, exitPrice: number, reason: string = "manual"): { pnl: number; pnlPct: number } | null {
   const idx = openPositions.findIndex((p) => p.id === tradeId);
   if (idx === -1) return null;
   const pos = openPositions[idx];
   const { pnl, pnlPct } = calcPnl(pos.side, pos.entryPrice, exitPrice, pos.margin, pos.leverage);
-  closePosition(idx, exitPrice, pnl, pnlPct, "manual");
+  closePosition(idx, exitPrice, pnl, pnlPct, reason);
   return { pnl, pnlPct };
 }
 
