@@ -1,6 +1,12 @@
+/**
+ * Trading engine: position lifecycle, TP/SL checks, persistence.
+ * Now multi-account aware — each account has its own positions and balance.
+ */
+
 import { state } from "./shared-state.js";
-import { settings, loadSettings } from "./settings.js";
 import * as db from "./db.js";
+import * as accountManager from "./account-manager.js";
+import { getStrategyConfig, getAutoTraderState, updateAutoTraderState } from "./account-manager.js";
 
 const PERSIST_INTERVAL = 30000;
 
@@ -18,13 +24,6 @@ interface MemPosition {
   entryTime: string;
   instId: string;
 }
-
-// ---- In-memory state (zero DB reads on hot path) ----
-
-const openPositions: MemPosition[] = [];
-let recentClosedTrades: any[] = [];
-let nextId = 1;
-let lastPersistTime = Date.now();
 
 // ---- Helpers ----
 
@@ -48,44 +47,253 @@ function nowStr(): string {
   return beijing.toISOString().replace("T", " ").slice(0, 19);
 }
 
-/** Sync in-memory state → shared state (for frontend broadcast) */
-function syncStateFromMemory() {
-  state.balance = Math.round(state.balance * 100) / 100;
+// ---- Position lifecycle ----
 
-  // Compute positions with current market data
-  const cp = state.currentPrice;
-  let totalPositionValue = 0;
-  let totalUnrealizedPnl = 0;
-  state.positions = openPositions.map((p) => {
+/** Open a position for a specific account */
+export function openTrade(
+  entryPrice: number,
+  margin: number,
+  leverage: number,
+  positionValue: number,
+  side: string = "long",
+  instId = "BTC-USDT",
+  accountId = 1,
+): number {
+  const id = db.createTrade(side, entryPrice, margin, positionValue, leverage, instId, accountId);
+  const pos: MemPosition = {
+    id,
+    side,
+    entryPrice,
+    margin,
+    leverage,
+    positionValue,
+    highestPrice: entryPrice,
+    lowestPrice: entryPrice,
+    entryTime: nowStr(),
+    instId,
+  };
+  accountManager.addPosition(accountId, pos);
+
+  // Deduct margin from account balance
+  const acct = accountManager.getAccount(accountId);
+  if (acct) {
+    accountManager.updateBalance(accountId, acct.balance - margin, acct.totalPnl);
+  }
+
+  persistAccount(accountId);
+
+  const label = side === "short" ? "SHORT" : "BUY";
+  console.log(`[trade] ${label} #${id} (acct #${accountId}): price=${entryPrice} margin=${margin} pos=${positionValue}`);
+  return id;
+}
+
+/** Close a position manually */
+export function manualClose(
+  tradeId: number,
+  exitPrice: number,
+  reason: string = "manual",
+  accountId?: number,
+): { pnl: number; pnlPct: number } | null {
+  // Try to find the position — if accountId provided, check that account; otherwise check all
+  if (accountId !== undefined) {
+    return closeFromAccount(tradeId, exitPrice, reason, accountId);
+  }
+  // Search all accounts
+  for (const a of accountManager.getAllAccounts()) {
+    const result = closeFromAccount(tradeId, exitPrice, reason, a.id);
+    if (result) return result;
+  }
+  return null;
+}
+
+function closeFromAccount(
+  tradeId: number,
+  exitPrice: number,
+  reason: string,
+  accountId: number,
+): { pnl: number; pnlPct: number } | null {
+  const pos = accountManager.getPositions(accountId).find((p) => p.id === tradeId);
+  if (!pos) return null;
+  const { pnl, pnlPct } = calcPnl(pos.side, pos.entryPrice, exitPrice, pos.margin, pos.leverage);
+  closePosition(accountId, tradeId, exitPrice, pnl, pnlPct, reason);
+  return { pnl, pnlPct };
+}
+
+function closePosition(
+  accountId: number,
+  tradeId: number,
+  exitPrice: number,
+  pnl: number,
+  pnlPct: number,
+  reason: string,
+) {
+  const pos = accountManager.removePosition(accountId, tradeId);
+  if (!pos) return;
+
+  const acct = accountManager.getAccount(accountId)!;
+
+  // Update account
+  const newBalance = acct.balance + pos.margin + pnl;
+  const newTotalPnl = acct.totalPnl + pnl;
+  accountManager.updateBalance(accountId, newBalance, newTotalPnl);
+
+  // Update stats
+  const stats = {
+    totalTrades: acct.totalTrades + 1,
+    winningTrades: acct.winningTrades + (pnl > 0 ? 1 : 0),
+    losingTrades: acct.losingTrades + (pnl <= 0 ? 1 : 0),
+    totalVolume: acct.totalVolume + pos.positionValue,
+    totalTurnover: acct.totalTurnover + pos.positionValue,
+  };
+  accountManager.updateStats(accountId, stats);
+
+  // Build closed trade record
+  const risk = getStrategyConfig(accountId).risk;
+  const isLong = pos.side === "long";
+  let stopLossPrice: number, takeProfitPrice = 0, isActivated = false;
+  if (isLong) {
+    stopLossPrice = pos.entryPrice * (1 - risk.stop_loss_pct / pos.leverage);
+    const activationPrice = pos.entryPrice * (1 + risk.take_profit_activation_pct / pos.leverage);
+    isActivated = risk.take_profit_activation_pct > 0 && pos.highestPrice >= activationPrice;
+    if (risk.take_profit_activation_pct > 0) {
+      takeProfitPrice = isActivated
+        ? pos.entryPrice + (pos.highestPrice - pos.entryPrice) * (1 - risk.take_profit_pullback)
+        : activationPrice;
+    }
+  } else {
+    stopLossPrice = pos.entryPrice * (1 + risk.stop_loss_pct / pos.leverage);
+    const activationPrice = pos.entryPrice * (1 - risk.take_profit_activation_pct / pos.leverage);
+    isActivated = risk.take_profit_activation_pct > 0 && pos.lowestPrice <= activationPrice;
+    if (risk.take_profit_activation_pct > 0) {
+      takeProfitPrice = isActivated
+        ? pos.entryPrice - (pos.entryPrice - pos.lowestPrice) * (1 - risk.take_profit_pullback)
+        : activationPrice;
+    }
+  }
+
+  const closed = {
+    id: pos.id,
+    side: pos.side,
+    entry_price: pos.entryPrice,
+    exit_price: exitPrice,
+    margin: pos.margin,
+    leverage: pos.leverage,
+    position_value: pos.positionValue,
+    inst_id: pos.instId,
+    pnl,
+    pnl_percent: pnlPct,
+    status: "closed",
+    entry_time: pos.entryTime,
+    exit_time: nowStr(),
+    exit_reason: reason,
+    stop_loss_price: Math.round(stopLossPrice * 100) / 100,
+    take_profit_price: Math.round(takeProfitPrice * 100) / 100,
+    take_profit_activated: isActivated,
+  };
+
+  accountManager.addRecentTrade(accountId, closed);
+
+  // Persist
+  db.closeTrade(pos.id, exitPrice, pnl, pnlPct, reason);
+  persistAccount(accountId);
+
+  console.log(
+    `[engine] ${reason.toUpperCase()} #${pos.id} (acct #${accountId}): entry=${pos.entryPrice} exit=${exitPrice} pnl=${pnl} (${pnlPct}%)`,
+  );
+}
+
+// ---- Price-tick check (hot path, no DB) ----
+
+let lastCheckPrice = 0;
+
+/** Check all open positions across all accounts against current price */
+export function checkPositions(price: number): boolean {
+  if (price <= 0) return false;
+  lastCheckPrice = price;
+  let didTrade = false;
+
+  for (const acct of accountManager.getAllAccounts()) {
+    const risk = getStrategyConfig(acct.id).risk;
+    const positions = acct.positions;
+
+    for (let i = positions.length - 1; i >= 0; i--) {
+      const pos = positions[i];
+
+      if (pos.side === "long") {
+        // Track high-water mark
+        if (price > pos.highestPrice) pos.highestPrice = price;
+
+        const stopPrice = pos.entryPrice * (1 - risk.stop_loss_pct / pos.leverage);
+        const activationPrice = pos.entryPrice * (1 + risk.take_profit_activation_pct / pos.leverage);
+        const isActivated = pos.highestPrice >= activationPrice;
+        const trailPrice = pos.entryPrice + (pos.highestPrice - pos.entryPrice) * (1 - risk.take_profit_pullback);
+
+        if (price <= stopPrice) {
+          const { pnl, pnlPct } = calcPnl("long", pos.entryPrice, price, pos.margin, pos.leverage);
+          closePosition(acct.id, pos.id, price, pnl, pnlPct, "stop_loss");
+          didTrade = true;
+        } else if (isActivated && price <= trailPrice && trailPrice > pos.entryPrice) {
+          const { pnl, pnlPct } = calcPnl("long", pos.entryPrice, price, pos.margin, pos.leverage);
+          closePosition(acct.id, pos.id, price, pnl, pnlPct, "take_profit");
+          didTrade = true;
+        }
+      } else {
+        // Short position
+        if (price < pos.lowestPrice) pos.lowestPrice = price;
+
+        const stopPrice = pos.entryPrice * (1 + risk.stop_loss_pct / pos.leverage);
+        const activationPrice = pos.entryPrice * (1 - risk.take_profit_activation_pct / pos.leverage);
+        const isActivated = risk.take_profit_activation_pct > 0 && pos.lowestPrice <= activationPrice;
+        const trailPrice = pos.entryPrice - (pos.entryPrice - pos.lowestPrice) * (1 - risk.take_profit_pullback);
+
+        if (price >= stopPrice) {
+          const { pnl, pnlPct } = calcPnl("short", pos.entryPrice, price, pos.margin, pos.leverage);
+          closePosition(acct.id, pos.id, price, pnl, pnlPct, "stop_loss");
+          didTrade = true;
+        } else if (isActivated && price >= trailPrice && trailPrice < pos.entryPrice) {
+          const { pnl, pnlPct } = calcPnl("short", pos.entryPrice, price, pos.margin, pos.leverage);
+          closePosition(acct.id, pos.id, price, pnl, pnlPct, "take_profit");
+          didTrade = true;
+        }
+      }
+    }
+  }
+
+  return didTrade;
+}
+
+/** Compute position views for a specific account (for frontend display) */
+export function computePositionViews(accountId: number, currentPrice: number): any[] {
+  const acct = accountManager.getAccount(accountId);
+  if (!acct) return [];
+
+  const risk = getStrategyConfig(accountId).risk;
+
+  return acct.positions.map((p) => {
     const isLong = p.side === "long";
-    // For long: marketValue = posValue * (cur/entry); for short: inverse
-    const marketValue = cp > 0
-      ? (isLong ? (p.positionValue / p.entryPrice) * cp
-                : p.positionValue + (p.entryPrice - cp) / p.entryPrice * p.positionValue)
+    const marketValue = currentPrice > 0
+      ? (isLong ? (p.positionValue / p.entryPrice) * currentPrice
+                : p.positionValue + (p.entryPrice - currentPrice) / p.entryPrice * p.positionValue)
       : p.positionValue;
-    const upnl = cp > 0 ? marketValue - p.positionValue : 0;
-    totalPositionValue += marketValue;
-    totalUnrealizedPnl += upnl;
+    const upnl = currentPrice > 0 ? marketValue - p.positionValue : 0;
 
-    // TP/SL prices
     let stopLossPrice: number, takeProfitPrice = 0, isActivated = false;
     if (isLong) {
-      stopLossPrice = p.entryPrice * (1 - settings.stopLossPct / p.leverage);
-      const activationPrice = p.entryPrice * (1 + settings.takeProfitActivationPct / p.leverage);
-      isActivated = settings.takeProfitActivationPct > 0 && p.highestPrice >= activationPrice;
-      if (settings.takeProfitActivationPct > 0) {
+      stopLossPrice = p.entryPrice * (1 - risk.stop_loss_pct / p.leverage);
+      const activationPrice = p.entryPrice * (1 + risk.take_profit_activation_pct / p.leverage);
+      isActivated = risk.take_profit_activation_pct > 0 && p.highestPrice >= activationPrice;
+      if (risk.take_profit_activation_pct > 0) {
         takeProfitPrice = isActivated
-          ? p.entryPrice + (p.highestPrice - p.entryPrice) * (1 - settings.takeProfitPullback)
+          ? p.entryPrice + (p.highestPrice - p.entryPrice) * (1 - risk.take_profit_pullback)
           : activationPrice;
       }
     } else {
-      // Short: SL when price rises above entry, TP when price falls
-      stopLossPrice = p.entryPrice * (1 + settings.stopLossPct / p.leverage);
-      const activationPrice = p.entryPrice * (1 - settings.takeProfitActivationPct / p.leverage);
-      isActivated = settings.takeProfitActivationPct > 0 && p.lowestPrice <= activationPrice;
-      if (settings.takeProfitActivationPct > 0) {
+      stopLossPrice = p.entryPrice * (1 + risk.stop_loss_pct / p.leverage);
+      const activationPrice = p.entryPrice * (1 - risk.take_profit_activation_pct / p.leverage);
+      isActivated = risk.take_profit_activation_pct > 0 && p.lowestPrice <= activationPrice;
+      if (risk.take_profit_activation_pct > 0) {
         takeProfitPrice = isActivated
-          ? p.entryPrice - (p.entryPrice - p.lowestPrice) * (1 - settings.takeProfitPullback)
+          ? p.entryPrice - (p.entryPrice - p.lowestPrice) * (1 - risk.take_profit_pullback)
           : activationPrice;
       }
     }
@@ -110,269 +318,54 @@ function syncStateFromMemory() {
       take_profit_activated: isActivated,
     };
   });
-  state.totalPositionValue = Math.round(totalPositionValue * 100) / 100;
-  state.totalUnrealizedPnl = Math.round(totalUnrealizedPnl * 100) / 100;
-  state.recentTrades = recentClosedTrades;
 }
 
 // ---- Persistence ----
 
-function persistNow() {
-  db.updateAccount(state.balance, state.totalPnl);
-  db.updateStats(
-    state.totalTrades, state.winningTrades, state.losingTrades,
-    state.totalVolume, state.totalTurnover,
-  );
-  lastPersistTime = Date.now();
+let lastPersistTime = Date.now();
+
+function persistAccount(accountId: number): void {
+  accountManager.persistAccount(accountId);
 }
 
-function persistExtremePrices() {
-  for (const p of openPositions) {
-    db.updateHighestPrice(p.id, p.highestPrice);
-    db.updateLowestPrice(p.id, p.lowestPrice);
+function persistAllExtremePrices(): void {
+  for (const acct of accountManager.getAllAccounts()) {
+    accountManager.persistExtremePrices(acct.id);
   }
 }
 
-/** Periodic: persist highest_price + account/stats to DB */
-export function periodicPersist() {
-  persistExtremePrices();
+/** Periodic: persist extreme prices + account/stats to DB */
+export function periodicPersist(): void {
+  persistAllExtremePrices();
   if (Date.now() - lastPersistTime >= PERSIST_INTERVAL) {
-    persistNow();
-  }
-}
-
-// ---- Position lifecycle ----
-
-/** Open a position (called from routes on manual buy / auto-trader) */
-export function openTrade(
-  entryPrice: number,
-  margin: number,
-  leverage: number,
-  positionValue: number,
-  side: string = "long",
-  instId = "BTC-USDT",
-): number {
-  const id = db.createTrade(side, entryPrice, margin, positionValue, leverage, instId);
-  openPositions.push({
-    id,
-    side,
-    entryPrice,
-    margin,
-    leverage,
-    positionValue,
-    highestPrice: entryPrice,
-    lowestPrice: entryPrice,
-    entryTime: nowStr(),
-    instId,
-  });
-  state.balance -= margin;
-  if (id >= nextId) nextId = id + 1;
-  syncStateFromMemory();
-  persistNow();
-  const label = side === "short" ? "SHORT" : "BUY";
-  console.log(`[trade] ${label} #${id}: price=${entryPrice} margin=${margin} pos=${positionValue}`);
-  return id;
-}
-
-/** Close a position (called from routes or auto-trader) */
-export function manualClose(tradeId: number, exitPrice: number, reason: string = "manual"): { pnl: number; pnlPct: number } | null {
-  const idx = openPositions.findIndex((p) => p.id === tradeId);
-  if (idx === -1) return null;
-  const pos = openPositions[idx];
-  const { pnl, pnlPct } = calcPnl(pos.side, pos.entryPrice, exitPrice, pos.margin, pos.leverage);
-  closePosition(idx, exitPrice, pnl, pnlPct, reason);
-  return { pnl, pnlPct };
-}
-
-function closePosition(
-  idx: number,
-  exitPrice: number,
-  pnl: number,
-  pnlPct: number,
-  reason: string,
-) {
-  const pos = openPositions[idx];
-  openPositions.splice(idx, 1);
-
-  // Update account
-  state.balance += pos.margin + pnl;
-  state.totalPnl += pnl;
-
-  // Update stats
-  state.totalTrades++;
-  if (pnl > 0) state.winningTrades++;
-  else state.losingTrades++;
-  state.totalVolume += pos.positionValue;
-  state.totalTurnover += pos.positionValue;
-
-  // Add to recent-closed list
-  const isLong = pos.side === "long";
-  let stopLossPrice: number, takeProfitPrice = 0, isActivated = false;
-  if (isLong) {
-    stopLossPrice = pos.entryPrice * (1 - settings.stopLossPct / pos.leverage);
-    const activationPrice = pos.entryPrice * (1 + settings.takeProfitActivationPct / pos.leverage);
-    isActivated = settings.takeProfitActivationPct > 0 && pos.highestPrice >= activationPrice;
-    if (settings.takeProfitActivationPct > 0) {
-      takeProfitPrice = isActivated
-        ? pos.entryPrice + (pos.highestPrice - pos.entryPrice) * (1 - settings.takeProfitPullback)
-        : activationPrice;
+    for (const acct of accountManager.getAllAccounts()) {
+      accountManager.persistAccount(acct.id);
     }
-  } else {
-    stopLossPrice = pos.entryPrice * (1 + settings.stopLossPct / pos.leverage);
-    const activationPrice = pos.entryPrice * (1 - settings.takeProfitActivationPct / pos.leverage);
-    isActivated = settings.takeProfitActivationPct > 0 && pos.lowestPrice <= activationPrice;
-    if (settings.takeProfitActivationPct > 0) {
-      takeProfitPrice = isActivated
-        ? pos.entryPrice - (pos.entryPrice - pos.lowestPrice) * (1 - settings.takeProfitPullback)
-        : activationPrice;
-    }
+    lastPersistTime = Date.now();
   }
-  const closed = {
-    id: pos.id,
-    side: pos.side,
-    entry_price: pos.entryPrice,
-    exit_price: exitPrice,
-    margin: pos.margin,
-    leverage: pos.leverage,
-    position_value: pos.positionValue,
-    inst_id: pos.instId,
-    pnl,
-    pnl_percent: pnlPct,
-    status: "closed",
-    entry_time: pos.entryTime,
-    exit_time: nowStr(),
-    exit_reason: reason,
-    stop_loss_price: Math.round(stopLossPrice * 100) / 100,
-    take_profit_price: Math.round(takeProfitPrice * 100) / 100,
-    take_profit_activated: isActivated,
-  };
-  recentClosedTrades.unshift(closed);
-  if (recentClosedTrades.length > 20) recentClosedTrades.pop();
-
-  syncStateFromMemory();
-  persistNow();
-  db.closeTrade(pos.id, exitPrice, pnl, pnlPct, reason);
-
-  console.log(
-    `[engine] ${reason.toUpperCase()} #${pos.id}: entry=${pos.entryPrice} exit=${exitPrice} pnl=${pnl} (${pnlPct}%)`,
-  );
-}
-
-// ---- Price-tick check (hot path, no DB) ----
-
-let lastCheckPrice = 0;
-
-/** Check all open positions against current price. Returns true if any trade closed. */
-export function checkPositions(price: number): boolean {
-  if (price <= 0) return false;
-  lastCheckPrice = price;
-  let didTrade = false;
-
-  for (let i = openPositions.length - 1; i >= 0; i--) {
-    const pos = openPositions[i];
-
-    if (pos.side === "long") {
-      // Track high-water mark
-      if (price > pos.highestPrice) pos.highestPrice = price;
-
-      // Long stop: price drops below entry
-      const stopPrice = pos.entryPrice * (1 - settings.stopLossPct / pos.leverage);
-      const activationPrice =
-        pos.entryPrice * (1 + settings.takeProfitActivationPct / pos.leverage);
-      const isActivated = pos.highestPrice >= activationPrice;
-      const trailPrice =
-        pos.entryPrice + (pos.highestPrice - pos.entryPrice) * (1 - settings.takeProfitPullback);
-
-      if (price <= stopPrice) {
-        const { pnl, pnlPct } = calcPnl("long", pos.entryPrice, price, pos.margin, pos.leverage);
-        closePosition(i, price, pnl, pnlPct, "stop_loss");
-        didTrade = true;
-      } else if (isActivated && price <= trailPrice && trailPrice > pos.entryPrice) {
-        const { pnl, pnlPct } = calcPnl("long", pos.entryPrice, price, pos.margin, pos.leverage);
-        closePosition(i, price, pnl, pnlPct, "take_profit");
-        didTrade = true;
-      }
-
-    } else {
-      // Short position
-      // Track low-water mark (lowest price reached)
-      if (price < pos.lowestPrice) pos.lowestPrice = price;
-
-      // Short stop: price rises above entry
-      const stopPrice = pos.entryPrice * (1 + settings.stopLossPct / pos.leverage);
-      const activationPrice =
-        pos.entryPrice * (1 - settings.takeProfitActivationPct / pos.leverage);
-      const isActivated = settings.takeProfitActivationPct > 0 && pos.lowestPrice <= activationPrice;
-      const trailPrice =
-        pos.entryPrice - (pos.entryPrice - pos.lowestPrice) * (1 - settings.takeProfitPullback);
-
-      if (price >= stopPrice) {
-        const { pnl, pnlPct } = calcPnl("short", pos.entryPrice, price, pos.margin, pos.leverage);
-        closePosition(i, price, pnl, pnlPct, "stop_loss");
-        didTrade = true;
-      } else if (isActivated && price >= trailPrice && trailPrice < pos.entryPrice) {
-        const { pnl, pnlPct } = calcPnl("short", pos.entryPrice, price, pos.margin, pos.leverage);
-        closePosition(i, price, pnl, pnlPct, "take_profit");
-        didTrade = true;
-      }
-    }
-  }
-
-  if (didTrade) syncStateFromMemory();
-  return didTrade;
 }
 
 // ---- Startup ----
 
-/** Load persisted state from DB into memory */
+/** Load all account state from DB into memory */
 export function loadState(): void {
-  const acct = db.getAccount();
-  if (acct) {
-    state.balance = acct.balance;
-    state.totalPnl = acct.total_pnl;
+  accountManager.loadAccountsFromDb();
+
+  // Log summary
+  for (const acct of accountManager.getAllAccounts()) {
+    const full = accountManager.getAccount(acct.id);
+    console.log(
+      `[engine] Account #${acct.id} "${acct.name}": balance=$${acct.balance} positions=${full?.positions.length ?? 0} trades=${acct.totalTrades}`,
+    );
   }
 
-  const stats = db.getStats();
-  if (stats) {
-    state.totalTrades = stats.total_trades;
-    state.winningTrades = stats.winning_trades;
-    state.losingTrades = stats.losing_trades;
-    state.totalVolume = stats.total_volume;
-    state.totalTurnover = stats.total_turnover;
-  }
-
-  // Load open positions into memory
-  const rows = db.getOpenPositions();
-  openPositions.length = 0;
-  for (const r of rows) {
-    openPositions.push({
-      id: r.id,
-      side: r.side,
-      entryPrice: r.entry_price,
-      margin: r.margin,
-      leverage: r.leverage,
-      positionValue: r.position_value,
-      highestPrice: r.highest_price ?? r.entry_price,
-      lowestPrice: r.lowest_price ?? r.entry_price,
-      entryTime: r.entry_time,
-      instId: r.inst_id ?? "BTC-USDT",
-    });
-    if (r.id >= nextId) nextId = r.id + 1;
-  }
-
-  recentClosedTrades = db.getClosedTrades(20);
-  syncStateFromMemory();
   lastPersistTime = Date.now();
-
-  console.log(
-    `[engine] Loaded: balance=$${state.balance} positions=${openPositions.length} trades=${state.totalTrades}`,
-  );
 }
 
 export function startTradingEngine(): void {
-  loadSettings();
   loadState();
-  const pp = (settings.stopLossPct / settings.leverage * 100).toFixed(1);
-  const tp = (settings.takeProfitPullback * 100).toFixed(1);
+  const risk = getStrategyConfig(accountManager.getActiveAccountId()).risk;
+  const pp = (risk.stop_loss_pct / risk.leverage * 100).toFixed(1);
+  const tp = (risk.take_profit_pullback * 100).toFixed(1);
   console.log(`[engine] Ready: stop=${pp}% price drop, trail=give back ${tp}% of profit`);
 }

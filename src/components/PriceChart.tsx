@@ -165,12 +165,25 @@ export const PriceChart = memo(function PriceChart({
     const mh = macdPane.addSeries(HistogramSeries, {
       color: "#26a69a33",
       priceFormat: { type: "volume" },
+      priceScaleId: "histogram",
     });
     const ml = macdPane.addSeries(LineSeries, {
       color: "#2962FF",
       lineWidth: 2,
       lastValueVisible: false,
       priceLineVisible: false,
+      autoscaleInfoProvider: (original: () => any) => {
+        const info = original();
+        if (!info) return info;
+        const r = info.priceRange;
+        const pad = (r.maxValue - r.minValue) * 0.1;
+        return {
+          priceRange: {
+            minValue: r.minValue - pad,
+            maxValue: r.maxValue + pad,
+          },
+        };
+      },
     });
     const sl = macdPane.addSeries(LineSeries, {
       color: "#FF6D00",

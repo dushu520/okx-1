@@ -1,12 +1,13 @@
 import { useState, useEffect } from "react";
-import type { TradingSettings } from "../types";
+import { StrategyEditor } from "./StrategyEditor";
+import type { StrategyConfig, RiskConfig } from "../types";
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
 
-type TabName = "basic" | "long" | "short";
+type TabName = "basic" | "long" | "short" | "advanced";
 
 interface FormState {
   margin_per_trade: number;
@@ -21,12 +22,16 @@ interface FormState {
   rsi_buy_max: number;
   imbalance_sell: number;
   rsi_sell_min: number;
+  strategy_exit: boolean;
+  // Full strategy config (advanced mode)
+  strategy_config: StrategyConfig | null;
 }
 
 const tabs: { key: TabName; label: string }[] = [
   { key: "basic", label: "基本设置" },
   { key: "long", label: "做多条件" },
   { key: "short", label: "做空条件" },
+  { key: "advanced", label: "策略编辑器" },
 ];
 
 export function SettingsModal({ open, onClose }: Props) {
@@ -38,15 +43,16 @@ export function SettingsModal({ open, onClose }: Props) {
   useEffect(() => {
     if (!open) return;
     setTab("basic");
+    setMsg("");
     fetch("/api/settings")
       .then((r) => r.json())
-      .then((data: TradingSettings) =>
+      .then((data: any) =>
         setForm({
           margin_per_trade: data.margin_per_trade,
           leverage: data.leverage,
-          stop_loss_pct: data.stop_loss_pct * 100,
-          take_profit_activation_pct: data.take_profit_activation_pct * 100,
-          take_profit_pullback: data.take_profit_pullback * 100,
+          stop_loss_pct: data.stop_loss_pct,
+          take_profit_activation_pct: data.take_profit_activation_pct,
+          take_profit_pullback: data.take_profit_pullback,
           momentum_ticks: data.momentum_ticks,
           volume_periods: data.volume_periods,
           rsi_period: data.rsi_period,
@@ -54,6 +60,8 @@ export function SettingsModal({ open, onClose }: Props) {
           rsi_buy_max: data.rsi_buy_max,
           imbalance_sell: data.imbalance_sell,
           rsi_sell_min: data.rsi_sell_min,
+          strategy_exit: data.strategy_exit,
+          strategy_config: data.strategy_config ?? null,
         }),
       )
       .catch(() => setMsg("加载设置失败"));
@@ -64,14 +72,36 @@ export function SettingsModal({ open, onClose }: Props) {
     setForm({ ...form, [k]: parseFloat(v) || 0 });
   };
 
+  const updateStrategyConfig = (config: StrategyConfig) => {
+    if (!form) return;
+    setForm({ ...form, strategy_config: config });
+  };
+
   const doSave = async () => {
     if (!form) return;
     setSaving(true);
     try {
+      let body: any;
+
+      if (tab === "advanced" && form.strategy_config) {
+        // Advanced mode: save full strategy config
+        body = { strategy_config: form.strategy_config };
+      } else {
+        // Simple mode: compute risk params from form
+        body = {
+          margin_per_trade: form.margin_per_trade,
+          leverage: form.leverage,
+          stop_loss_pct: form.stop_loss_pct,
+          take_profit_activation_pct: form.take_profit_activation_pct,
+          take_profit_pullback: form.take_profit_pullback,
+          strategy_exit: form.strategy_exit,
+        };
+      }
+
       const resp = await fetch("/api/settings", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(form),
+        body: JSON.stringify(body),
       });
       const data = await resp.json();
       if (data.ok) {
@@ -94,13 +124,9 @@ export function SettingsModal({ open, onClose }: Props) {
     ? (f.stop_loss_pct / f.leverage).toFixed(1)
     : "2.0";
 
-  const activationPriceMove = f && f.leverage > 0
-    ? (f.take_profit_activation_pct / f.leverage).toFixed(1)
-    : "0";
-
   return (
     <div className="modal-overlay">
-      <div className="modal" onClick={(e) => e.stopPropagation()}>
+      <div className="modal modal-wide" onClick={(e) => e.stopPropagation()}>
         <div className="modal-header">
           <h2>交易设置</h2>
           <button className="modal-close" onClick={onClose}>✕</button>
@@ -171,43 +197,27 @@ export function SettingsModal({ open, onClose }: Props) {
                   onChange={(e) => update("take_profit_activation_pct", e.target.value)}
                 />
                 <span className="modal-hint">
-                  持仓盈利 {f?.take_profit_activation_pct.toFixed(1) ?? "5"}% 启动追踪止盈（上涨 {activationPriceMove}%）
+                  持仓盈利 {f?.take_profit_activation_pct.toFixed(1) ?? "5"}% 启动追踪止盈
                 </span>
               </label>
 
               <hr className="modal-sep" />
 
-              <div className="settings-grid">
-                <label className="modal-field">
-                  <span>动量检查周期 (tick)</span>
-                  <input
-                    type="number" min={1} max={20}
-                    value={f?.momentum_ticks ?? 3}
-                    onChange={(e) => update("momentum_ticks", e.target.value)}
-                  />
-                  <span className="modal-hint">连续采样点数确认动量</span>
-                </label>
-
-                <label className="modal-field">
-                  <span>成交量均线周期</span>
-                  <input
-                    type="number" min={2} max={50}
-                    value={f?.volume_periods ?? 10}
-                    onChange={(e) => update("volume_periods", e.target.value)}
-                  />
-                  <span className="modal-hint">K线数量</span>
-                </label>
-
-                <label className="modal-field">
-                  <span>RSI 计算周期</span>
-                  <input
-                    type="number" min={2} max={30}
-                    value={f?.rsi_period ?? 5}
-                    onChange={(e) => update("rsi_period", e.target.value)}
-                  />
-                  <span className="modal-hint">K线周期数</span>
-                </label>
-              </div>
+              <label className="modal-field" style={{ flexDirection: "row", alignItems: "center", gap: 10 }}>
+                <input
+                  type="checkbox"
+                  checked={f?.strategy_exit ?? true}
+                  onChange={(e) => {
+                    if (!f) return;
+                    setForm({ ...f, strategy_exit: e.target.checked });
+                  }}
+                  style={{ width: 18, height: 18 }}
+                />
+                <span>策略平仓</span>
+              </label>
+              <span className="modal-hint" style={{ marginTop: -8 }}>
+                启用后，自动交易将根据策略信号平仓。关闭后仅依赖止盈止损平仓。
+              </span>
             </>
           )}
 
@@ -232,6 +242,9 @@ export function SettingsModal({ open, onClose }: Props) {
                 />
                 <span className="modal-hint">RSI 低于此值时允许买入（避免超买）</span>
               </label>
+
+              <hr className="modal-sep" />
+              <p className="modal-tip">提示：使用"策略编辑器"标签页可以更灵活地配置入场/出场条件组。</p>
             </>
           )}
 
@@ -256,7 +269,14 @@ export function SettingsModal({ open, onClose }: Props) {
                 />
                 <span className="modal-hint">RSI 高于此值时允许做空（确认超买后回落）</span>
               </label>
+
+              <hr className="modal-sep" />
+              <p className="modal-tip">提示：使用"策略编辑器"标签页可以更灵活地配置入场/出场条件组。</p>
             </>
+          )}
+
+          {tab === "advanced" && f?.strategy_config && (
+            <StrategyEditor config={f.strategy_config} onChange={updateStrategyConfig} />
           )}
         </div>
 

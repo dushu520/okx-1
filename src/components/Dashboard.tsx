@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { useWebSocket } from "../hooks/useWebSocket";
 import { ConnectionBanner } from "./ConnectionBanner";
 import { PositionsTable } from "./PositionsTable";
@@ -6,25 +6,28 @@ import { TradeHistory } from "./TradeHistory";
 import { SettingsModal } from "./SettingsModal";
 import { TradeDetailModal } from "./TradeDetailModal";
 import { PriceChart } from "./PriceChart";
-import type { TradingSettings, TradeRow } from "../types";
+import { AccountSelector } from "./AccountSelector";
+import type { TradingSettings, TradeRow, StateSnapshot } from "../types";
 
 export function Dashboard() {
-  const snapshot = useWebSocket();
+  const { snapshot, activeAccountId, switchAccount } = useWebSocket();
   const [msg, setMsg] = useState<{ text: string; ok: boolean } | null>(null);
   const [showSettings, setShowSettings] = useState(false);
   const [tradingSettings, setTradingSettings] = useState<TradingSettings | null>(null);
   const [selectedTrade, setSelectedTrade] = useState<TradeRow | null>(null);
 
+  // Reload settings when active account changes
   useEffect(() => {
     fetch("/api/settings")
       .then((r) => r.json())
       .then((s: TradingSettings) => setTradingSettings(s))
       .catch(() => {});
-  }, []);
+  }, [activeAccountId]);
 
   const d = snapshot;
 
   const price = d?.current_price ?? 0;
+  const swapPrice = d?.swap_price ?? 0;
   const balance = d?.balance ?? 10000;
   const initialBalance = d?.initial_balance ?? 10000;
   const totalPnl = d?.total_pnl ?? 0;
@@ -47,6 +50,7 @@ export function Dashboard() {
   const atImbalance = autoTrader?.imbalance ?? 0;
   const atRsi = autoTrader?.rsi ?? 0;
   const atSide = autoTrader?.side;
+
   const winRate = totalTrades > 0 ? ((wins / totalTrades) * 100).toFixed(1) : "--";
   const pnlPct = initialBalance > 0 ? ((totalPnl / initialBalance) * 100).toFixed(1) : "0.0";
 
@@ -55,17 +59,18 @@ export function Dashboard() {
     setTimeout(() => setMsg(null), 3000);
   };
 
-  const doBuy = async () => {
+  const doOpen = async (side: string) => {
     try {
-      const resp = await fetch("/api/buy", { method: "POST" });
+      const resp = await fetch(`/api/${side}`, { method: "POST" });
       const data = await resp.json();
+      const label = side === "short" ? "做空" : "做多";
       if (data.ok) {
         showMsg(
-          `买入成功! 入场价: $${Number(data.entry_price).toFixed(2)} | 保证金: $${data.margin} | 仓位: $${data.position_value}`,
+          `${label}成功! 入场价: $${Number(data.entry_price).toFixed(2)} | 保证金: $${data.margin} | 仓位: $${data.position_value}`,
           true
         );
       } else {
-        showMsg(data.error || "买入失败", false);
+        showMsg(data.error || `${label}失败`, false);
       }
     } catch {
       showMsg("请求失败", false);
@@ -89,6 +94,14 @@ export function Dashboard() {
     }
   };
 
+  const onSettingsClose = useCallback(() => {
+    setShowSettings(false);
+    fetch("/api/settings")
+      .then((r) => r.json())
+      .then((s: TradingSettings) => setTradingSettings(s))
+      .catch(() => {});
+  }, []);
+
   return (
     <>
       <ConnectionBanner connected={wsConnected} price={price} />
@@ -96,6 +109,7 @@ export function Dashboard() {
       <div className="header">
         <div className="header-left">
           <h1>OKX 模拟交易</h1>
+          <AccountSelector activeAccountId={activeAccountId} onSwitch={switchAccount} />
           <span>
             <span className={`ws-dot ${wsConnected ? "on" : "off"}`} />
             <span className="ws-status">
@@ -174,6 +188,17 @@ export function Dashboard() {
                 {positions.length > 0 ? `${positions.length} 笔` : "无持仓"}
               </div>
             </div>
+            <div className="indicator-card">
+              <div className="indicator-label">合约价格</div>
+              <div className="indicator-value" style={{ color: swapPrice > 0 ? "var(--yellow)" : undefined }}>
+                {swapPrice > 0 ? "$" + swapPrice.toFixed(2) : "--"}
+              </div>
+              <div className="indicator-desc">
+                {swapPrice > 0 && price > 0
+                  ? (swapPrice > price ? "溢价 $" + (swapPrice - price).toFixed(2) : "折价 $" + (price - swapPrice).toFixed(2))
+                  : "--"}
+              </div>
+            </div>
           </div>
 
           {/* Compact Stats */}
@@ -233,19 +258,23 @@ export function Dashboard() {
               </div>
             </div>
           </div>
+
+          <div className="action-bar">
+            <button className="btn-long" onClick={() => doOpen("buy")} disabled={price <= 0 || !wsConnected}>
+              做多 BTC ({tradingSettings?.leverage ?? 5}x {tradingSettings?.margin_per_trade ?? 100}$)
+            </button>
+            <button className="btn-short" onClick={() => doOpen("short")} disabled={price <= 0 || !wsConnected}>
+              做空 BTC ({tradingSettings?.leverage ?? 5}x {tradingSettings?.margin_per_trade ?? 100}$)
+            </button>
+            {msg && (
+              <span className={`msg show ${msg.ok ? "ok" : "err"}`}>{msg.text}</span>
+            )}
+          </div>
         </div>
       </div>
 
-      {/* Action bar + Positions */}
+      {/* Positions */}
       <div className="layout-bottom">
-        <div className="action-bar">
-          <button className="btn-buy" onClick={doBuy} disabled={price <= 0 || !wsConnected}>
-            买入 BTC ({tradingSettings?.leverage ?? 5}x {tradingSettings?.margin_per_trade ?? 100}$)
-          </button>
-          {msg && (
-            <span className={`msg show ${msg.ok ? "ok" : "err"}`}>{msg.text}</span>
-          )}
-        </div>
 
         <div className="section">
           <div className="section-title">当前持仓 ({positions.length})</div>
@@ -270,13 +299,8 @@ export function Dashboard() {
 
       <SettingsModal
         open={showSettings}
-        onClose={() => {
-          setShowSettings(false);
-          fetch("/api/settings")
-            .then((r) => r.json())
-            .then((s: TradingSettings) => setTradingSettings(s))
-            .catch(() => {});
-        }}
+        key={activeAccountId}
+        onClose={onSettingsClose}
       />
     </>
   );

@@ -122,17 +122,23 @@ export function startWs(): void {
     "wss://ws.okx.com:443/ws/v5/public",
     [
       { channel: "tickers", instId: "BTC-USDT" },
+      { channel: "tickers", instId: "BTC-USDT-SWAP" },
       { channel: "books5", instId: "BTC-USDT" },
     ],
     (channel, data) => {
       if (channel === "tickers" && data[0]?.last) {
         const price = parseFloat(data[0].last);
         if (!isNaN(price) && price > 0) {
-          marketData.recordPriceTick(price);
-          state.currentPrice = price;
-          state.currentTime = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().replace("T", " ").slice(0, 19);
-          state.priceUpdatedAt = Date.now();
-          priceCallback?.(price);
+          const instId = data[0].instId;
+          if (instId === "BTC-USDT-SWAP") {
+            state.swapPrice = price;
+          } else {
+            marketData.recordPriceTick(price);
+            state.currentPrice = price;
+            state.currentTime = new Date(Date.now() + 8 * 60 * 60 * 1000).toISOString().replace("T", " ").slice(0, 19);
+            state.priceUpdatedAt = Date.now();
+            priceCallback?.(price);
+          }
         }
       } else if (channel === "books5") {
         marketData.updateBids(data[0].bids ?? []);

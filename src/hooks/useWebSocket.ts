@@ -1,9 +1,29 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import type { StateSnapshot } from "../types";
 
 export function useWebSocket() {
   const [snapshot, setSnapshot] = useState<StateSnapshot | null>(null);
+  const [activeAccountId, setActiveAccountId] = useState(1);
   const wsRef = useRef<WebSocket | null>(null);
+
+  // Switch account via REST API — server will WS broadcast with new account's data
+  const switchAccount = useCallback(async (id: number) => {
+    try {
+      const resp = await fetch("/api/accounts/switch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ account_id: id }),
+      });
+      const data = await resp.json();
+      if (data.ok) {
+        setActiveAccountId(id);
+        // Also fetch state snapshot immediately via REST
+        const stateResp = await fetch("/api/state");
+        const stateData: StateSnapshot = await stateResp.json();
+        setSnapshot(stateData);
+      }
+    } catch { /* ignore */ }
+  }, []);
 
   useEffect(() => {
     let mounted = true;
@@ -38,7 +58,12 @@ export function useWebSocket() {
         if (!mounted) return;
         scheduleMessageTimeout(ws);
         try {
-          setSnapshot(JSON.parse(e.data));
+          const data = JSON.parse(e.data);
+          setSnapshot(data);
+          // Track active account from server state
+          if (data.active_account_id && data.active_account_id !== activeAccountId) {
+            setActiveAccountId(data.active_account_id);
+          }
         } catch { /* ignore */ }
       };
 
@@ -77,11 +102,15 @@ export function useWebSocket() {
 
     function poll() {
       if (!active) return;
-      // only poll if we haven't received anything via WS recently
       fetch("/api/state")
         .then((r) => r.json())
         .then((data: StateSnapshot) => {
-          if (active) setSnapshot(data);
+          if (active) {
+            setSnapshot(data);
+            if (data.active_account_id) {
+              setActiveAccountId(data.active_account_id);
+            }
+          }
         })
         .catch(() => {});
     }
@@ -90,5 +119,5 @@ export function useWebSocket() {
     return () => { active = false; clearInterval(timer); };
   }, []);
 
-  return snapshot;
+  return { snapshot, activeAccountId, switchAccount };
 }

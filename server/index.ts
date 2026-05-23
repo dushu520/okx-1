@@ -10,12 +10,9 @@ import { fetchAccountBalance } from "./okx-rest.js";
 import { onPrice, startWs } from "./okx-ws.js";
 import { setupRoutes } from "./routes.js";
 import { state } from "./shared-state.js";
-import {
-  startTradingEngine,
-  checkPositions,
-  periodicPersist,
-} from "./trading-engine.js";
-import { startAutoTrader } from "./auto-trader.js";
+import { startTradingEngine, checkPositions, periodicPersist, computePositionViews } from "./trading-engine.js";
+import * as strategyRunner from "./strategy-runner.js";
+import * as accountManager from "./account-manager.js";
 import {
   fetchCandlesForBar, refreshCandlesForBar,
   getCandlesForChartBar, getCurrentCandleForBar, CHART_BARS,
@@ -30,8 +27,34 @@ function beijingStrToEpoch(s: string): number {
   return new Date(s + " +08:00").getTime();
 }
 
-function buildSnapshot(): any {
-  const snap = state.getSnapshot();
+function buildSnapshot(accountId?: number): any {
+  const aid = accountId ?? accountManager.getActiveAccountId();
+  const acct = accountManager.getAccount(aid);
+  if (!acct) return {};
+
+  const price = state.currentPrice;
+  const views = computePositionViews(aid, price);
+
+  const snap: any = {
+    current_price: price,
+    swap_price: state.swapPrice,
+    current_time: state.currentTime,
+    balance: acct.balance,
+    initial_balance: acct.initialBalance,
+    total_pnl: acct.totalPnl,
+    total_trades: acct.totalTrades,
+    winning_trades: acct.winningTrades,
+    losing_trades: acct.losingTrades,
+    total_volume: acct.totalVolume,
+    total_turnover: acct.totalTurnover,
+    positions: views,
+    recent_trades: acct.recentTrades,
+    total_position_value: views.reduce((s: number, p: any) => s + (p.market_value ?? 0), 0),
+    total_unrealized_pnl: views.reduce((s: number, p: any) => s + (p.unrealized_pnl ?? 0), 0),
+    ws_connected: state.wsConnected,
+    auto_trader: acct.autoTraderState,
+    active_account_id: aid,
+  };
 
   // Primary 5m candles (backwards-compat)
   snap.candles = getCandlesForChartBar("5m", 150);
@@ -63,8 +86,9 @@ function buildSnapshot(): any {
       markers.push({ time, position: "inBar", shape: profit ? "arrowUp" : "arrowDown", color: profit ? "#3fb950" : "#f85149", text: profit ? "TP" : "SL" });
     }
   };
-  for (const p of state.positions) addMarker(p.entry_time, p.side, "entry");
-  for (const t of state.recentTrades) {
+  // Use active account's positions and trades for markers
+  for (const p of views) addMarker(p.entry_time, p.side, "entry");
+  for (const t of acct.recentTrades) {
     addMarker(t.entry_time, t.side, "entry");
     if (t.exit_time) addMarker(t.exit_time, t.side, "exit", t.pnl);
   }
@@ -73,9 +97,9 @@ function buildSnapshot(): any {
   return snap;
 }
 
-function broadcast(): void {
+function broadcast(accountId?: number): void {
   try {
-    const data = JSON.stringify(buildSnapshot());
+    const data = JSON.stringify(buildSnapshot(accountId));
     wss.clients.forEach((client) => {
       if (client.readyState === 1) client.send(data);
     });
@@ -87,7 +111,7 @@ function broadcast(): void {
 // ---- Startup ----
 
 initDb();
-startTradingEngine(); // loads DB state into memory
+startTradingEngine(); // loads all accounts & positions from DB into account-manager
 
 // Fetch real OKX balance (async, non-critical, display only)
 fetchAccountBalance().then((bal) => {
@@ -117,11 +141,26 @@ const wss = new WebSocketServer({ server, path: "/ws" });
 wss.on("connection", (ws) => {
   console.log(`[ws] Frontend connected (${wss.clients.size})`);
   ws.send(JSON.stringify(buildSnapshot()));
+
+  // Listen for account switch messages from frontend
+  ws.on("message", (raw: Buffer | string) => {
+    try {
+      const text = typeof raw === "string" ? raw : raw.toString();
+      const msg = JSON.parse(text);
+      if (msg.type === "switch_account" && msg.account_id) {
+        const acct = accountManager.setActiveAccount(msg.account_id);
+        if (acct) {
+          console.log(`[ws] Switched to account #${msg.account_id} via WS`);
+          ws.send(JSON.stringify(buildSnapshot()));
+        }
+      }
+    } catch { /* ignore invalid messages */ }
+  });
+
   ws.on("close", () => console.log(`[ws] Frontend disconnected (${wss.clients.size})`));
 });
 
 // ---- Real-time data flow ----
-// OKX WS price tick → check positions in memory → if price changed → broadcast
 
 let lastPrice = 0;
 let lastATJson = "";
@@ -129,7 +168,7 @@ let lastATJson = "";
 onPrice(() => {
   const price = state.currentPrice;
 
-  // Check positions (purely in-memory, no DB)
+  // Check positions across all accounts (purely in-memory, no DB)
   checkPositions(price);
 
   // Only push to frontend when price actually changed
@@ -141,7 +180,8 @@ onPrice(() => {
 
 // Broadcast auto-trader state changes to frontend (runs in-between price ticks)
 setInterval(() => {
-  const cur = JSON.stringify(state.autoTraderState);
+  const acct = accountManager.getActiveAccount();
+  const cur = JSON.stringify(acct.autoTraderState);
   if (cur !== lastATJson) {
     lastATJson = cur;
     broadcast();
@@ -155,7 +195,6 @@ setInterval(broadcast, 5000);
 setInterval(periodicPersist, 30000);
 
 // Heartbeat for frontend WebSocket connections — send ping frames every 25s
-// to keep connections alive through proxies / load balancers
 setInterval(() => {
   wss.clients.forEach((client) => {
     if (client.readyState === 1) client.ping();
@@ -177,8 +216,8 @@ setInterval(async () => {
   }
 }, 30000);
 
-// Start auto-trader (降频: checks every 3s once data is ready)
-startAutoTrader();
+// Start strategy runner (replaces old auto-trader)
+strategyRunner.startRunner();
 
 // ---- Listen ----
 

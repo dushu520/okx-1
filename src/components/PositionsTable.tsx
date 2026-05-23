@@ -34,23 +34,21 @@ export function PositionsTable({ positions, currentPrice, onSell, onSelect }: Pr
       </thead>
       <tbody>
         {positions.map((p) => {
-          const quantity = p.entry_price > 0
-            ? p.position_value / p.entry_price
-            : 0;
-          const marketValue = currentPrice > 0
-            ? quantity * currentPrice
-            : p.position_value;
-          const upnl = marketValue - p.position_value;
-          const upnlPct = p.margin > 0 ? (upnl / p.margin) * 100 : 0;
+          // Use server-calculated values (correct for both long and short)
+          const marketValue = p.market_value ?? p.position_value;
+          const upnl = p.unrealized_pnl ?? 0;
+          const upnlPct = p.unrealized_pnl_pct ?? (p.margin > 0 ? (upnl / p.margin) * 100 : 0);
           const pnlClass = upnl >= 0 ? "pnl-pos" : "pnl-neg";
 
           return (
             <tr key={p.id} className="clickable-row" onClick={() => onSelect(p)}>
               <td>#{p.id}</td>
               <td>{p.inst_id ?? "BTC-USDT"}</td>
-              <td style={{ color: "var(--green)" }}>多</td>
+              <td style={{ color: p.side === "short" ? "var(--red)" : "var(--green)" }}>
+                {p.side === "short" ? "空" : "多"}
+              </td>
               <td>{p.leverage}x</td>
-              <td>{quantity.toFixed(8)}</td>
+              <td>{p.position_value > 0 && p.entry_price > 0 ? (p.position_value / p.entry_price).toFixed(8) : "--"}</td>
               <td>${p.entry_price.toFixed(2)}</td>
               <td>{currentPrice > 0 ? "$" + currentPrice.toFixed(2) : "--"}</td>
               <td>${p.margin.toFixed(2)}</td>
