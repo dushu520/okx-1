@@ -42,7 +42,9 @@ export function TradeHistory({ trades, onSelect }: Props) {
             <tr key={t.id} className="clickable-row" onClick={() => onSelect(t)}>
               <td>#{t.id}</td>
               <td>{t.inst_id ?? "BTC-USDT"}</td>
-              <td style={{ color: "var(--green)" }}>多</td>
+              <td style={{ color: t.side === "short" ? "var(--red)" : "var(--green)" }}>
+                {t.side === "short" ? "空" : "多"}
+              </td>
               <td>{t.leverage}x</td>
               <td>${t.entry_price.toFixed(2)}</td>
               <td>${(t.exit_price ?? 0).toFixed(2)}</td>
